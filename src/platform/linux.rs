@@ -1,8 +1,6 @@
-use super::{CursorData, ResultType};
+use super::{gtk_sudo, CursorData, ResultType};
 use desktop::Desktop;
-#[cfg(all(feature = "linux_headless"))]
-#[cfg(not(any(feature = "flatpak", feature = "appimage")))]
-use hbb_common::config::CONFIG_OPTION_ALLOW_LINUX_HEADLESS;
+use hbb_common::config::keys::OPTION_ALLOW_LINUX_HEADLESS;
 pub use hbb_common::platform::linux::*;
 use hbb_common::{
     allow_err,
@@ -11,14 +9,12 @@ use hbb_common::{
     config::Config,
     libc::{c_char, c_int, c_long, c_void},
     log,
-    message_proto::Resolution,
+    message_proto::{DisplayInfo, Resolution},
     regex::{Captures, Regex},
 };
 use std::{
     cell::RefCell,
     ffi::OsStr,
-    fs::File,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command},
     string::String,
@@ -53,6 +49,20 @@ extern "C" {
         screen_num: *mut c_int,
     ) -> c_int;
     fn xdo_new(display: *const c_char) -> Xdo;
+    fn xdo_get_active_window(xdo: Xdo, window: *mut *mut c_void) -> c_int;
+    fn xdo_get_window_location(
+        xdo: Xdo,
+        window: *mut c_void,
+        x: *mut c_int,
+        y: *mut c_int,
+        screen_num: *mut c_int,
+    ) -> c_int;
+    fn xdo_get_window_size(
+        xdo: Xdo,
+        window: *mut c_void,
+        width: *mut c_int,
+        height: *mut c_int,
+    ) -> c_int;
 }
 
 #[link(name = "X11")]
@@ -82,10 +92,8 @@ pub struct xcb_xfixes_get_cursor_image {
 }
 
 #[inline]
-#[cfg(feature = "linux_headless")]
-#[cfg(not(any(feature = "flatpak", feature = "appimage")))]
 pub fn is_headless_allowed() -> bool {
-    Config::get_option(CONFIG_OPTION_ALLOW_LINUX_HEADLESS) == "Y"
+    Config::get_option(OPTION_ALLOW_LINUX_HEADLESS) == "Y"
 }
 
 #[inline]
@@ -118,6 +126,50 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
 }
 
 pub fn reset_input_cache() {}
+
+pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
+    let mut res = None;
+    XDO.with(|xdo| {
+        if let Ok(xdo) = xdo.try_borrow_mut() {
+            if xdo.is_null() {
+                return;
+            }
+            let mut x: c_int = 0;
+            let mut y: c_int = 0;
+            let mut width: c_int = 0;
+            let mut height: c_int = 0;
+            let mut window: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                if xdo_get_active_window(*xdo, &mut window) != 0 {
+                    return;
+                }
+                if xdo_get_window_location(
+                    *xdo,
+                    window,
+                    &mut x as _,
+                    &mut y as _,
+                    std::ptr::null_mut(),
+                ) != 0
+                {
+                    return;
+                }
+                if xdo_get_window_size(*xdo, window, &mut width as _, &mut height as _) != 0 {
+                    return;
+                }
+                let center_x = x + width / 2;
+                let center_y = y + height / 2;
+                res = displays.iter().position(|d| {
+                    center_x >= d.x
+                        && center_x < d.x + d.width
+                        && center_y >= d.y
+                        && center_y < d.y + d.height
+                });
+            }
+        }
+    });
+    res
+}
 
 pub fn get_cursor() -> ResultType<Option<u64>> {
     let mut res = None;
@@ -268,17 +320,20 @@ fn set_x11_env(desktop: &Desktop) {
 #[inline]
 fn stop_rustdesk_servers() {
     let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E 'rustdesk +--server' | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        r##"ps -ef | grep -E '{} +--server' | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
     ));
 }
 
 #[inline]
 fn stop_subprocess() {
     let _ = run_cmds(&format!(
-        r##"ps -ef | grep '/etc/rustdesk/xorg.conf' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        r##"ps -ef | grep '/etc/{}/xorg.conf' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
     ));
     let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E 'rustdesk +--cm-no-ui' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        r##"ps -ef | grep -E '{} +--cm-no-ui' | grep -v grep | awk '{{printf("kill -9 %d\n", $2)}}' | bash"##,
+        crate::get_app_name().to_lowercase(),
     ));
 }
 
@@ -555,8 +610,15 @@ pub fn get_env_var(k: &str) -> String {
     }
 }
 
+fn is_flatpak() -> bool {
+    std::path::PathBuf::from("/.flatpak-info").exists()
+}
+
 // Headless is enabled, always return true.
 pub fn is_prelogin() -> bool {
+    if is_flatpak() {
+        return false;
+    }
     let n = get_active_userid().len();
     n < 4 && n > 1
 }
@@ -674,6 +736,7 @@ pub fn block_input(_v: bool) -> (bool, String) {
 pub fn is_installed() -> bool {
     if let Ok(p) = std::env::current_exe() {
         p.to_str().unwrap_or_default().starts_with("/usr")
+            || p.to_str().unwrap_or_default().starts_with("/nix/store")
     } else {
         false
     }
@@ -708,27 +771,18 @@ pub fn quit_gui() {
     unsafe { gtk_main_quit() };
 }
 
+/*
 pub fn exec_privileged(args: &[&str]) -> ResultType<Child> {
     Ok(Command::new("pkexec").args(args).spawn()?)
 }
+*/
 
 pub fn check_super_user_permission() -> ResultType<bool> {
-    let file = "/usr/share/rustdesk/files/polkit";
-    let arg;
-    if Path::new(file).is_file() {
-        arg = file;
-    } else {
-        arg = "echo";
-    }
-    // https://github.com/rustdesk/rustdesk/issues/2756
-    if let Ok(status) = Command::new("pkexec").arg(arg).status() {
-        // https://github.com/rustdesk/rustdesk/issues/5205#issuecomment-1658059657s
-        Ok(status.code() != Some(126) && status.code() != Some(127))
-    } else {
-        Ok(true)
-    }
+    gtk_sudo::run(vec!["echo"])?;
+    Ok(true)
 }
 
+/*
 pub fn elevate(args: Vec<&str>) -> ResultType<bool> {
     let cmd = std::env::current_exe()?;
     match cmd.to_str() {
@@ -763,6 +817,7 @@ pub fn elevate(args: Vec<&str>) -> ResultType<bool> {
         }
     }
 }
+*/
 
 type GtkSettingsPtr = *mut c_void;
 type GObjectPtr = *mut c_void;
@@ -930,7 +985,6 @@ mod desktop {
     const IBUS_DAEMON: &str = "ibus-daemon";
     const PLASMA_KDED: &str = "kded[0-9]+";
     const GNOME_GOA_DAEMON: &str = "goa-daemon";
-    const RUSTDESK_TRAY: &str = "rustdesk +--tray";
 
     #[derive(Debug, Clone, Default)]
     pub struct Desktop {
@@ -962,13 +1016,14 @@ mod desktop {
         }
 
         fn get_display_xauth_xwayland(&mut self) {
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
             for _ in 0..5 {
                 let display_proc = vec![
                     XWAYLAND,
                     IBUS_DAEMON,
                     GNOME_GOA_DAEMON,
                     PLASMA_KDED,
-                    RUSTDESK_TRAY,
+                    tray.as_str(),
                 ];
                 for proc in display_proc {
                     self.display = get_env("DISPLAY", &self.uid, proc);
@@ -1020,7 +1075,7 @@ mod desktop {
                 "getent passwd '{}' | awk -F':' '{{print $6}}'",
                 &self.username
             );
-            self.home = run_cmds(&cmd).unwrap_or(format!("/home/{}", &self.username));
+            self.home = run_cmds_trim_newline(&cmd).unwrap_or(format!("/home/{}", &self.username));
         }
 
         fn get_xauth_from_xorg(&mut self) {
@@ -1066,6 +1121,7 @@ mod desktop {
 
         fn get_xauth_x11(&mut self) {
             // try by direct access to window manager process by name
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
             for _ in 0..10 {
                 let display_proc = vec![
                     XWAYLAND,
@@ -1074,7 +1130,7 @@ mod desktop {
                     PLASMA_KDED,
                     XFCE4_PANEL,
                     SDDM_GREETER,
-                    RUSTDESK_TRAY,
+                    tray.as_str(),
                 ];
                 for proc in display_proc {
                     self.xauth = get_env("XAUTHORITY", &self.uid, proc);
@@ -1159,8 +1215,11 @@ mod desktop {
 
         fn set_is_subprocess(&mut self) {
             self.is_rustdesk_subprocess = false;
-            let cmd = "ps -ef | grep 'rustdesk/xorg.conf' | grep -v grep | wc -l";
-            if let Ok(res) = run_cmds(cmd) {
+            let cmd = format!(
+                "ps -ef | grep '{}/xorg.conf' | grep -v grep | wc -l",
+                crate::get_app_name().to_lowercase()
+            );
+            if let Ok(res) = run_cmds(&cmd) {
                 if res.trim() != "0" {
                     self.is_rustdesk_subprocess = true;
                 }
@@ -1177,7 +1236,7 @@ mod desktop {
                 return;
             }
 
-            let seat0_values = get_values_of_seat0(&[0, 1, 2]);
+            let seat0_values = get_values_of_seat0_with_gdm_wayland(&[0, 1, 2]);
             if seat0_values[0].is_empty() {
                 *self = Self::default();
                 self.is_rustdesk_subprocess = false;
@@ -1211,6 +1270,29 @@ mod desktop {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_desktop_env() {
+            let mut d = Desktop::default();
+            d.refresh();
+            if d.username == "root" {
+                assert_eq!(d.home, "/root");
+            } else {
+                if !d.username.is_empty() {
+                    let home = super::super::get_env_var("HOME");
+                    if !home.is_empty() {
+                        assert_eq!(d.home, home);
+                    } else {
+                        //
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct WakeLock(Option<keepawake::AwakeHandle>);
@@ -1236,21 +1318,8 @@ fn has_cmd(cmd: &str) -> bool {
         .unwrap_or_default()
 }
 
-pub fn run_cmds_pkexec(cmds: &str) -> bool {
-    const DONE: &str = "RUN_CMDS_PKEXEC_DONE";
-    if let Ok(output) = std::process::Command::new("pkexec")
-        .arg("sh")
-        .arg("-c")
-        .arg(&format!("{cmds} echo {DONE}"))
-        .output()
-    {
-        let out = String::from_utf8_lossy(&output.stdout);
-        log::debug!("cmds: {cmds}");
-        log::debug!("output: {out}");
-        out.contains(DONE)
-    } else {
-        false
-    }
+pub fn run_cmds_privileged(cmds: &str) -> bool {
+    crate::platform::gtk_sudo::run(vec![cmds]).is_ok()
 }
 
 pub fn run_me_with(secs: u32) {
@@ -1269,24 +1338,30 @@ fn switch_service(stop: bool) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     Config::set_option("stop-service".into(), if stop { "Y" } else { "" }.into());
     if home != "/root" && !Config::get().is_empty() {
-        format!("cp -f {home}/.config/rustdesk/RustDesk.toml /root/.config/rustdesk/; cp -f {home}/.config/rustdesk/RustDesk2.toml /root/.config/rustdesk/;")
+        let p = format!(".config/{}", crate::get_app_name().to_lowercase());
+        let app_name0 = crate::get_app_name();
+        format!("cp -f {home}/{p}/{app_name0}.toml /root/{p}/; cp -f {home}/{p}/{app_name0}2.toml /root/{p}/;")
     } else {
         "".to_owned()
     }
 }
 
-pub fn uninstall_service(show_new_window: bool) -> bool {
+pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     if !has_cmd("systemctl") {
+        // Failed when installed + flutter run + started by `show_new_window`.
         return false;
     }
     log::info!("Uninstalling service...");
     let cp = switch_service(true);
-    if !run_cmds_pkexec(&format!(
-        "systemctl disable rustdesk; systemctl stop rustdesk; {cp}"
+    let app_name = crate::get_app_name().to_lowercase();
+    // systemctl kill rustdesk --tray, execute cp first
+    if !run_cmds_privileged(&format!(
+        "{cp} systemctl disable {app_name}; systemctl stop {app_name};"
     )) {
         Config::set_option("stop-service".into(), "".into());
         return true;
     }
+    // systemctl stop will kill child processes, below may not be executed.
     if show_new_window {
         run_me_with(2);
     }
@@ -1300,42 +1375,49 @@ pub fn install_service() -> bool {
     }
     log::info!("Installing service...");
     let cp = switch_service(false);
-    if !run_cmds_pkexec(&format!(
-        "{cp} systemctl enable rustdesk; systemctl start rustdesk;"
+    let app_name = crate::get_app_name().to_lowercase();
+    if !run_cmds_privileged(&format!(
+        "{cp} systemctl enable {app_name}; systemctl start {app_name};"
     )) {
         Config::set_option("stop-service".into(), "Y".into());
-        return true;
     }
-    run_me_with(2);
-    std::process::exit(0);
+    true
 }
 
 fn check_if_stop_service() {
     if Config::get_option("stop-service".into()) == "Y" {
-        allow_err!(run_cmds(
-            "systemctl disable rustdesk; systemctl stop rustdesk"
-        ));
+        let app_name = crate::get_app_name().to_lowercase();
+        allow_err!(run_cmds(&format!(
+            "systemctl disable {app_name}; systemctl stop {app_name}"
+        )));
     }
 }
 
 pub fn check_autostart_config() -> ResultType<()> {
     let home = std::env::var("HOME").unwrap_or_default();
+    let app_name = crate::get_app_name().to_lowercase();
     let path = format!("{home}/.config/autostart");
-    let file = format!("{path}/rustdesk.desktop");
-    std::fs::create_dir_all(&path).ok();
-    if !Path::new(&file).exists() {
-        // write text to the desktop file
-        let mut file = std::fs::File::create(&file)?;
-        file.write_all(
+    let file = format!("{path}/{app_name}.desktop");
+    // https://github.com/rustdesk/rustdesk/issues/4863
+    std::fs::remove_file(&file).ok();
+    /*
+        std::fs::create_dir_all(&path).ok();
+        if !Path::new(&file).exists() {
+            // write text to the desktop file
+            let mut file = std::fs::File::create(&file)?;
+            file.write_all(
+                format!(
+                    "
+    [Desktop Entry]
+    Type=Application
+    Exec={app_name} --tray
+    NoDisplay=false
             "
-[Desktop Entry]
-Type=Application
-Exec=rustdesk --tray
-NoDisplay=false
-        "
-            .as_bytes(),
-        )?;
-    }
+                )
+                .as_bytes(),
+            )?;
+        }
+        */
     Ok(())
 }
 
