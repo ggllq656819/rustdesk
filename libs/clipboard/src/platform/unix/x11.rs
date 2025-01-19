@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use hbb_common::log;
 use once_cell::sync::OnceCell;
@@ -26,7 +29,7 @@ pub struct X11Clipboard {
 }
 
 impl X11Clipboard {
-    pub fn new(ignore_path: &PathBuf) -> Result<Self, CliprdrError> {
+    pub fn new(ignore_path: &Path) -> Result<Self, CliprdrError> {
         let clipboard = get_clip()?;
         let text_uri_list = clipboard
             .setter
@@ -89,7 +92,13 @@ impl SysClipboard for X11Clipboard {
     fn set_file_list(&self, paths: &[PathBuf]) -> Result<(), CliprdrError> {
         *self.former_file_list.lock() = paths.to_vec();
 
-        let uri_list: Vec<String> = paths.iter().map(encode_path_to_uri).collect();
+        let uri_list: Vec<String> = {
+            let mut v = Vec::new();
+            for path in paths {
+                v.push(encode_path_to_uri(path)?);
+            }
+            v
+        };
         let uri_list = uri_list.join("\n");
         let text_uri_list_data = uri_list.as_bytes().to_vec();
         let gnome_copied_files_data = ["copy\n".as_bytes(), uri_list.as_bytes()].concat();
